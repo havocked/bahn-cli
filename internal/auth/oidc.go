@@ -11,8 +11,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
-	"runtime"
 	"strings"
 	"time"
 
@@ -24,13 +22,10 @@ const (
 	clientID        = "kf_web"
 	scopes          = "openid vendo"
 	realRedirectURI = "https://www.bahn.de/.resources/bahn-common-light/webresources/assets/html/auth.v2.html"
-	pollInterval    = 500 * time.Millisecond
-	pollTimeout     = 120 * time.Second
 )
 
 // Login performs the OIDC browser login flow.
-// On macOS, it auto-detects the auth code from the browser tab URL.
-// On other platforms, falls back to paste-URL mode.
+// Opens browser, user logs in, pastes callback URL.
 func Login(onStatus func(string)) (*TokenSet, error) {
 	verifier, challenge, err := generatePKCE()
 	if err != nil {
@@ -38,110 +33,6 @@ func Login(onStatus func(string)) (*TokenSet, error) {
 	}
 	state := randomString(32)
 
-	if runtime.GOOS == "darwin" {
-		tokens, err := loginWithBrowserPoll(verifier, challenge, state, onStatus)
-		if err == nil {
-			return tokens, nil
-		}
-		// If AppleScript polling fails, fall back to paste
-		if onStatus != nil {
-			onStatus(fmt.Sprintf("Auto-detect failed (%v), falling back to manual mode...", err))
-		}
-	}
-
-	return loginWithPaste(verifier, challenge, state, onStatus)
-}
-
-// loginWithBrowserPoll opens the auth URL and polls the browser tab URL
-// via AppleScript until it contains the auth code.
-func loginWithBrowserPoll(verifier, challenge, state string, onStatus func(string)) (*TokenSet, error) {
-	authURL := buildAuthURL(realRedirectURI, state, challenge)
-
-	// Detect which browser to use
-	browserName := detectBrowser()
-	if browserName == "" {
-		return nil, fmt.Errorf("no supported browser found")
-	}
-
-	if onStatus != nil {
-		onStatus(fmt.Sprintf("Opening %s for login...", browserName))
-	}
-	if err := browser.OpenURL(authURL); err != nil {
-		return nil, fmt.Errorf("failed to open browser: %w", err)
-	}
-
-	if onStatus != nil {
-		onStatus("Log in to your DB account. Waiting for authentication...")
-	}
-
-	// Poll browser tab URL for the redirect with our state
-	deadline := time.Now().Add(pollTimeout)
-	for time.Now().Before(deadline) {
-		time.Sleep(pollInterval)
-
-		tabURL, err := getBrowserTabURL(browserName)
-		if err != nil {
-			continue // Browser might not be ready yet
-		}
-
-		// Check if the URL contains our state parameter
-		if !strings.Contains(tabURL, state) {
-			continue
-		}
-
-		// Extract code from fragment
-		code, returnedState, err := extractFragmentParams(tabURL)
-		if err != nil {
-			continue
-		}
-		if returnedState != state {
-			continue
-		}
-
-		if onStatus != nil {
-			onStatus("Authentication detected! Exchanging code for tokens...")
-		}
-		return exchangeCode(code, verifier, realRedirectURI)
-	}
-
-	return nil, fmt.Errorf("timed out waiting for authentication")
-}
-
-// detectBrowser returns the name of a running/available browser on macOS.
-func detectBrowser() string {
-	browsers := []string{"Google Chrome", "Brave Browser", "Chromium"}
-	for _, b := range browsers {
-		// Check if app exists
-		cmd := exec.Command("osascript", "-e",
-			fmt.Sprintf(`tell application "System Events" to (name of processes) contains "%s"`, b))
-		out, err := cmd.Output()
-		if err == nil && strings.TrimSpace(string(out)) == "true" {
-			return b
-		}
-	}
-	// Default to Google Chrome
-	return "Google Chrome"
-}
-
-// getBrowserTabURL reads the current tab's full URL (including fragment)
-// from a Chromium-based browser via AppleScript.
-func getBrowserTabURL(browserName string) (string, error) {
-	script := fmt.Sprintf(`tell application "%s"
-	if (count of windows) > 0 then
-		execute active tab of front window javascript "document.location.href"
-	end if
-end tell`, browserName)
-
-	cmd := exec.Command("osascript", "-e", script)
-	out, err := cmd.Output()
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(string(out)), nil
-}
-
-// loginWithPaste is the fallback: user pastes the callback URL.
-func loginWithPaste(verifier, challenge, state string, onStatus func(string)) (*TokenSet, error) {
 	authURL := buildAuthURL(realRedirectURI, state, challenge)
 
 	if onStatus != nil {
@@ -151,13 +42,13 @@ func loginWithPaste(verifier, challenge, state string, onStatus func(string)) (*
 
 	if onStatus != nil {
 		onStatus("")
-		onStatus("After logging in, you'll be redirected to bahn.de.")
-		onStatus("Copy the FULL URL from your browser's address bar and paste it here:")
+		onStatus("After logging in, copy the FULL URL from your browser's address bar and paste it here:")
 		onStatus("")
 	}
 
 	fmt.Fprint(os.Stderr, "> ")
 	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 0, 4096), 16384) // URLs can be long
 	if !scanner.Scan() {
 		return nil, fmt.Errorf("no input received")
 	}
@@ -180,7 +71,67 @@ func loginWithPaste(verifier, challenge, state string, onStatus func(string)) (*
 	return exchangeCode(code, verifier, realRedirectURI)
 }
 
-// extractFragmentParams pulls code and state from a URL fragment.
+// Refresh attempts to get new tokens using the Keycloak session.
+// It sends a silent auth request with prompt=none — if the Keycloak
+// session cookies are still alive, new tokens come back without user interaction.
+func Refresh(onStatus func(string)) (*TokenSet, error) {
+	verifier, challenge, err := generatePKCE()
+	if err != nil {
+		return nil, fmt.Errorf("PKCE generation failed: %w", err)
+	}
+	state := randomString(32)
+
+	authURL := buildAuthURL(realRedirectURI, state, challenge)
+	authURL += "&prompt=none"
+
+	if onStatus != nil {
+		onStatus("Attempting silent token refresh...")
+	}
+
+	// Make the request ourselves (no browser needed if we have session cookies)
+	client := &http.Client{
+		// Don't follow redirects — we want to capture the redirect URL
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+		Timeout: 10 * time.Second,
+	}
+
+	resp, err := client.Get(authURL)
+	if err != nil {
+		return nil, fmt.Errorf("refresh request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusFound && resp.StatusCode != http.StatusSeeOther {
+		return nil, fmt.Errorf("refresh failed: expected redirect, got status %d (session likely expired — run `bahn auth login`)", resp.StatusCode)
+	}
+
+	location := resp.Header.Get("Location")
+	if location == "" {
+		return nil, fmt.Errorf("refresh failed: no redirect location")
+	}
+
+	code, returnedState, err := extractFragmentParams(location)
+	if err != nil {
+		// Check for login_required error (session expired)
+		if strings.Contains(location, "error=login_required") {
+			return nil, fmt.Errorf("session expired — run `bahn auth login` to re-authenticate")
+		}
+		return nil, fmt.Errorf("refresh failed: %w", err)
+	}
+	if returnedState != state {
+		return nil, fmt.Errorf("state mismatch during refresh")
+	}
+
+	if onStatus != nil {
+		onStatus("Exchanging code for tokens...")
+	}
+	return exchangeCode(code, verifier, realRedirectURI)
+}
+
+// --- Fragment parsing ---
+
 func extractFragmentParams(rawURL string) (code, state string, err error) {
 	var fragment string
 	if idx := strings.Index(rawURL, "#"); idx >= 0 {

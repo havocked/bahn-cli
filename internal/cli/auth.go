@@ -140,7 +140,30 @@ func (cmd *AuthLoginCmd) Run(ctx *app.Context) error {
 type AuthRefreshCmd struct{}
 
 func (cmd *AuthRefreshCmd) Run(ctx *app.Context) error {
-	return app.WrapExit(1, fmt.Errorf("not implemented yet — silent refresh coming in step 4"))
+	onStatus := func(msg string) {
+		ctx.Output.Infof("%s", msg)
+	}
+	tokens, err := auth.Refresh(onStatus)
+	if err != nil {
+		return app.WrapExit(2, err)
+	}
+	if err := auth.SaveTokens(tokens); err != nil {
+		return err
+	}
+
+	remaining := tokens.TimeRemaining().Round(time.Second)
+	payload := map[string]any{
+		"status":        "ok",
+		"username":      tokens.Username,
+		"kundenkontoid": tokens.Kundenkontoid,
+		"expiresAt":     tokens.ExpiresAt.Format(time.RFC3339),
+		"remaining":     remaining.String(),
+	}
+	human := []string{
+		fmt.Sprintf("✓ Token refreshed for %s", tokens.Username),
+		fmt.Sprintf("  Valid for %s", remaining),
+	}
+	return ctx.Output.Emit(payload, human)
 }
 
 // --- auth clear ---
