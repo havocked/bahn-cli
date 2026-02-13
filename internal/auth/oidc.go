@@ -28,8 +28,8 @@ const (
 )
 
 // Login performs the OIDC browser login flow.
-// It tries localhost callback first; if that fails or isn't available,
-// falls back to paste-URL mode.
+// Uses the real bahn.de redirect URI — user pastes the callback URL back.
+// (localhost redirect is blocked by DB's WAF)
 func Login(onStatus func(string)) (*TokenSet, error) {
 	verifier, challenge, err := generatePKCE()
 	if err != nil {
@@ -37,13 +37,6 @@ func Login(onStatus func(string)) (*TokenSet, error) {
 	}
 	state := randomString(32)
 
-	// Try localhost callback first
-	tokens, err := loginWithLocalServer(verifier, challenge, state, onStatus)
-	if err == nil {
-		return tokens, nil
-	}
-
-	// Fallback: paste-URL mode
 	return loginWithPaste(verifier, challenge, state, onStatus)
 }
 
