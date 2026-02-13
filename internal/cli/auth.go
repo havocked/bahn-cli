@@ -108,7 +108,31 @@ func (cmd *AuthTokenCmd) Run(ctx *app.Context) error {
 type AuthLoginCmd struct{}
 
 func (cmd *AuthLoginCmd) Run(ctx *app.Context) error {
-	return app.WrapExit(1, fmt.Errorf("not implemented yet — OIDC browser flow coming in step 3"))
+	onStatus := func(msg string) {
+		ctx.Output.Infof("%s", msg)
+	}
+	tokens, err := auth.Login(onStatus)
+	if err != nil {
+		return err
+	}
+	if err := auth.SaveTokens(tokens); err != nil {
+		return err
+	}
+
+	remaining := tokens.TimeRemaining().Round(time.Second)
+	payload := map[string]any{
+		"status":        "ok",
+		"username":      tokens.Username,
+		"kundenkontoid": tokens.Kundenkontoid,
+		"expiresAt":     tokens.ExpiresAt.Format(time.RFC3339),
+		"remaining":     remaining.String(),
+	}
+	human := []string{
+		fmt.Sprintf("✓ Authenticated as %s", tokens.Username),
+		fmt.Sprintf("  Account: %s", tokens.Kundenkontoid),
+		fmt.Sprintf("  Token valid for %s", remaining),
+	}
+	return ctx.Output.Emit(payload, human)
 }
 
 // --- auth refresh ---
