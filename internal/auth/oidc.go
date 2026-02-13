@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -11,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -21,26 +23,35 @@ const (
 	keycloakBaseURL = "https://accounts.bahn.de/auth/realms/db/protocol/openid-connect"
 	clientID        = "kf_web"
 	scopes          = "openid vendo"
+	realRedirectURI = "https://www.bahn.de/.resources/bahn-common-light/webresources/assets/html/auth.v2.html"
 	callbackTimeout = 120 * time.Second
 )
 
-// Login performs the full OIDC browser login flow:
-// 1. Generate PKCE challenge
-// 2. Start local callback server
-// 3. Open browser to Keycloak auth URL
-// 4. Wait for auth code via callback
-// 5. Exchange code for tokens
+// Login performs the OIDC browser login flow.
+// It tries localhost callback first; if that fails or isn't available,
+// falls back to paste-URL mode.
 func Login(onStatus func(string)) (*TokenSet, error) {
-	// Step 1: PKCE
 	verifier, challenge, err := generatePKCE()
 	if err != nil {
 		return nil, fmt.Errorf("PKCE generation failed: %w", err)
 	}
+	state := randomString(32)
 
-	// Step 2: Start local server
+	// Try localhost callback first
+	tokens, err := loginWithLocalServer(verifier, challenge, state, onStatus)
+	if err == nil {
+		return tokens, nil
+	}
+
+	// Fallback: paste-URL mode
+	return loginWithPaste(verifier, challenge, state, onStatus)
+}
+
+// loginWithLocalServer tries the localhost callback approach.
+func loginWithLocalServer(verifier, challenge, state string, onStatus func(string)) (*TokenSet, error) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		return nil, fmt.Errorf("failed to start callback server: %w", err)
+		return nil, err
 	}
 	port := listener.Addr().(*net.TCPAddr).Port
 	redirectURI := fmt.Sprintf("http://localhost:%d/callback", port)
@@ -54,52 +65,120 @@ func Login(onStatus func(string)) (*TokenSet, error) {
 		_ = srv.Shutdown(ctx)
 	}()
 
-	// Step 3: Build auth URL and open browser
-	state := randomString(32)
 	authURL := buildAuthURL(redirectURI, state, challenge)
 
 	if onStatus != nil {
 		onStatus(fmt.Sprintf("Opening browser for login (port %d)...", port))
 	}
 	if err := browser.OpenURL(authURL); err != nil {
-		return nil, fmt.Errorf("failed to open browser: %w\n\nManually open: %s", err, authURL)
+		return nil, err
 	}
 
-	// Step 4: Wait for callback
 	if onStatus != nil {
 		onStatus("Waiting for authentication...")
 	}
+
 	var result callbackResult
 	select {
 	case result = <-codeChan:
 	case <-time.After(callbackTimeout):
-		return nil, fmt.Errorf("login timed out after %s", callbackTimeout)
+		return nil, fmt.Errorf("login timed out")
 	}
 	if result.err != nil {
 		return nil, result.err
 	}
 	if result.state != state {
+		return nil, fmt.Errorf("state mismatch")
+	}
+
+	return exchangeCode(result.code, verifier, redirectURI)
+}
+
+// loginWithPaste uses the real bahn.de redirect URI.
+// User logs in, then pastes the resulting URL back into the CLI.
+func loginWithPaste(verifier, challenge, state string, onStatus func(string)) (*TokenSet, error) {
+	authURL := buildAuthURL(realRedirectURI, state, challenge)
+
+	if onStatus != nil {
+		onStatus("Opening browser for login...")
+	}
+	_ = browser.OpenURL(authURL)
+
+	if onStatus != nil {
+		onStatus("")
+		onStatus("After logging in, you'll be redirected to bahn.de.")
+		onStatus("Copy the FULL URL from your browser's address bar and paste it here:")
+		onStatus("")
+	}
+
+	// Read URL from stdin
+	fmt.Fprint(os.Stderr, "> ")
+	scanner := bufio.NewScanner(os.Stdin)
+	if !scanner.Scan() {
+		return nil, fmt.Errorf("no input received")
+	}
+	pastedURL := strings.TrimSpace(scanner.Text())
+
+	if pastedURL == "" {
+		return nil, fmt.Errorf("empty URL")
+	}
+
+	// Extract code and state from the URL fragment
+	code, returnedState, err := extractFragmentParams(pastedURL)
+	if err != nil {
+		return nil, err
+	}
+
+	if returnedState != state {
 		return nil, fmt.Errorf("state mismatch: possible CSRF attack")
 	}
 
-	// Step 5: Exchange code for tokens
 	if onStatus != nil {
 		onStatus("Exchanging auth code for tokens...")
 	}
-	return exchangeCode(result.code, verifier, redirectURI)
+	return exchangeCode(code, verifier, realRedirectURI)
+}
+
+// extractFragmentParams pulls code and state from a URL with a fragment.
+// Handles both full URLs and just fragments.
+func extractFragmentParams(rawURL string) (code, state string, err error) {
+	// The fragment might be after #
+	var fragment string
+	if idx := strings.Index(rawURL, "#"); idx >= 0 {
+		fragment = rawURL[idx+1:]
+	} else {
+		// Maybe they just pasted the fragment part
+		fragment = rawURL
+	}
+
+	params, err := url.ParseQuery(fragment)
+	if err != nil {
+		return "", "", fmt.Errorf("invalid URL fragment: %w", err)
+	}
+
+	if errParam := params.Get("error"); errParam != "" {
+		desc := params.Get("error_description")
+		return "", "", fmt.Errorf("auth error: %s (%s)", errParam, desc)
+	}
+
+	code = params.Get("code")
+	if code == "" {
+		return "", "", fmt.Errorf("no auth code found in URL. Make sure you copied the full URL including the # part")
+	}
+
+	state = params.Get("state")
+	return code, state, nil
 }
 
 // --- PKCE ---
 
 func generatePKCE() (verifier, challenge string, err error) {
-	// 128 random bytes → base64url → 43-128 char verifier
 	buf := make([]byte, 96)
 	if _, err := rand.Read(buf); err != nil {
 		return "", "", err
 	}
 	verifier = base64.RawURLEncoding.EncodeToString(buf)
 
-	// S256: base64url(sha256(verifier))
 	hash := sha256.Sum256([]byte(verifier))
 	challenge = base64.RawURLEncoding.EncodeToString(hash[:])
 	return verifier, challenge, nil
@@ -127,7 +206,7 @@ func buildAuthURL(redirectURI, state, challenge string) string {
 	return keycloakBaseURL + "/auth?" + params.Encode()
 }
 
-// --- Callback server ---
+// --- Callback server (for localhost approach) ---
 
 type callbackResult struct {
 	code  string
@@ -135,15 +214,10 @@ type callbackResult struct {
 	err   error
 }
 
-// callbackHandler serves two purposes:
-// 1. /callback — serves an HTML page that reads the fragment and sends it to /exchange
-// 2. /exchange — receives the code+state from the HTML page
 func callbackHandler(codeChan chan<- callbackResult) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
-		// The auth code is in the URL fragment (#code=...&state=...).
-		// Fragments aren't sent to the server, so we serve a page that extracts them.
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = fmt.Fprint(w, callbackHTML)
 	})
