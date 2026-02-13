@@ -2,6 +2,7 @@ package auth
 
 import (
 	"bufio"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/pkg/browser"
+	"github.com/steipete/sweetcookie"
 )
 
 const (
@@ -71,9 +73,9 @@ func Login(onStatus func(string)) (*TokenSet, error) {
 	return exchangeCode(code, verifier, realRedirectURI)
 }
 
-// Refresh attempts to get new tokens using the Keycloak session.
-// It sends a silent auth request with prompt=none — if the Keycloak
-// session cookies are still alive, new tokens come back without user interaction.
+// Refresh attempts to get new tokens by reading Keycloak session cookies
+// from the browser and replaying them with a prompt=none auth request.
+// No user interaction needed if the browser session is still alive.
 func Refresh(onStatus func(string)) (*TokenSet, error) {
 	verifier, challenge, err := generatePKCE()
 	if err != nil {
@@ -85,19 +87,46 @@ func Refresh(onStatus func(string)) (*TokenSet, error) {
 	authURL += "&prompt=none"
 
 	if onStatus != nil {
-		onStatus("Attempting silent token refresh...")
+		onStatus("Reading browser cookies for accounts.bahn.de...")
 	}
 
-	// Make the request ourselves (no browser needed if we have session cookies)
+	// Read Keycloak session cookies from the browser
+	cookieResult, err := sweetcookie.Get(context.Background(), sweetcookie.Options{
+		URL:  "https://accounts.bahn.de/",
+		Mode: sweetcookie.ModeMerge,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to read browser cookies: %w (make sure you've logged into bahn.de recently)", err)
+	}
+
+	if len(cookieResult.Cookies) == 0 {
+		return nil, fmt.Errorf("no cookies found for accounts.bahn.de — log into bahn.de in your browser first, then retry")
+	}
+
+	if onStatus != nil {
+		onStatus(fmt.Sprintf("Found %d cookies, attempting silent refresh...", len(cookieResult.Cookies)))
+	}
+
+	// Build HTTP request with cookies
+	req, err := http.NewRequest("GET", authURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	for _, c := range cookieResult.Cookies {
+		req.AddCookie(&http.Cookie{
+			Name:  c.Name,
+			Value: c.Value,
+		})
+	}
+
 	client := &http.Client{
-		// Don't follow redirects — we want to capture the redirect URL
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
 		Timeout: 10 * time.Second,
 	}
 
-	resp, err := client.Get(authURL)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("refresh request failed: %w", err)
 	}
@@ -114,8 +143,7 @@ func Refresh(onStatus func(string)) (*TokenSet, error) {
 
 	code, returnedState, err := extractFragmentParams(location)
 	if err != nil {
-		// Check for login_required error (session expired)
-		if strings.Contains(location, "error=login_required") {
+		if strings.Contains(location, "error=login_required") || strings.Contains(location, "error=interaction_required") {
 			return nil, fmt.Errorf("session expired — run `bahn auth login` to re-authenticate")
 		}
 		return nil, fmt.Errorf("refresh failed: %w", err)
@@ -241,10 +269,6 @@ func exchangeCode(code, verifier, redirectURI string) (*TokenSet, error) {
 	if err := json.Unmarshal(body, &tokenResp); err != nil {
 		return nil, fmt.Errorf("parsing token response: %w", err)
 	}
-
-	// Log the full response for debugging (stderr)
-	fmt.Fprintf(os.Stderr, "[debug] token response keys: access_token=%v, id_token=%v, refresh_token=%v, expires_in=%d\n",
-		tokenResp.AccessToken != "", tokenResp.IDToken != "", tokenResp.RefreshToken != "", tokenResp.ExpiresIn)
 
 	tokens, err := TokenSetFromJWT(tokenResp.AccessToken)
 	if err != nil {
