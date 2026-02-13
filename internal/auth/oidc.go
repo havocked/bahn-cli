@@ -2,17 +2,17 @@ package auth
 
 import (
 	"bufio"
-	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
+	"runtime"
 	"strings"
 	"time"
 
@@ -24,12 +24,13 @@ const (
 	clientID        = "kf_web"
 	scopes          = "openid vendo"
 	realRedirectURI = "https://www.bahn.de/.resources/bahn-common-light/webresources/assets/html/auth.v2.html"
-	callbackTimeout = 120 * time.Second
+	pollInterval    = 500 * time.Millisecond
+	pollTimeout     = 120 * time.Second
 )
 
 // Login performs the OIDC browser login flow.
-// Uses the real bahn.de redirect URI — user pastes the callback URL back.
-// (localhost redirect is blocked by DB's WAF)
+// On macOS, it auto-detects the auth code from the browser tab URL.
+// On other platforms, falls back to paste-URL mode.
 func Login(onStatus func(string)) (*TokenSet, error) {
 	verifier, challenge, err := generatePKCE()
 	if err != nil {
@@ -37,58 +38,109 @@ func Login(onStatus func(string)) (*TokenSet, error) {
 	}
 	state := randomString(32)
 
+	if runtime.GOOS == "darwin" {
+		tokens, err := loginWithBrowserPoll(verifier, challenge, state, onStatus)
+		if err == nil {
+			return tokens, nil
+		}
+		// If AppleScript polling fails, fall back to paste
+		if onStatus != nil {
+			onStatus(fmt.Sprintf("Auto-detect failed (%v), falling back to manual mode...", err))
+		}
+	}
+
 	return loginWithPaste(verifier, challenge, state, onStatus)
 }
 
-// loginWithLocalServer tries the localhost callback approach.
-func loginWithLocalServer(verifier, challenge, state string, onStatus func(string)) (*TokenSet, error) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return nil, err
+// loginWithBrowserPoll opens the auth URL and polls the browser tab URL
+// via AppleScript until it contains the auth code.
+func loginWithBrowserPoll(verifier, challenge, state string, onStatus func(string)) (*TokenSet, error) {
+	authURL := buildAuthURL(realRedirectURI, state, challenge)
+
+	// Detect which browser to use
+	browserName := detectBrowser()
+	if browserName == "" {
+		return nil, fmt.Errorf("no supported browser found")
 	}
-	port := listener.Addr().(*net.TCPAddr).Port
-	redirectURI := fmt.Sprintf("http://localhost:%d/callback", port)
-
-	codeChan := make(chan callbackResult, 1)
-	srv := &http.Server{Handler: callbackHandler(codeChan)}
-	go func() { _ = srv.Serve(listener) }()
-	defer func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(ctx)
-	}()
-
-	authURL := buildAuthURL(redirectURI, state, challenge)
 
 	if onStatus != nil {
-		onStatus(fmt.Sprintf("Opening browser for login (port %d)...", port))
+		onStatus(fmt.Sprintf("Opening %s for login...", browserName))
 	}
 	if err := browser.OpenURL(authURL); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to open browser: %w", err)
 	}
 
 	if onStatus != nil {
-		onStatus("Waiting for authentication...")
+		onStatus("Log in to your DB account. Waiting for authentication...")
 	}
 
-	var result callbackResult
-	select {
-	case result = <-codeChan:
-	case <-time.After(callbackTimeout):
-		return nil, fmt.Errorf("login timed out")
-	}
-	if result.err != nil {
-		return nil, result.err
-	}
-	if result.state != state {
-		return nil, fmt.Errorf("state mismatch")
+	// Poll browser tab URL for the redirect with our state
+	deadline := time.Now().Add(pollTimeout)
+	for time.Now().Before(deadline) {
+		time.Sleep(pollInterval)
+
+		tabURL, err := getBrowserTabURL(browserName)
+		if err != nil {
+			continue // Browser might not be ready yet
+		}
+
+		// Check if the URL contains our state parameter
+		if !strings.Contains(tabURL, state) {
+			continue
+		}
+
+		// Extract code from fragment
+		code, returnedState, err := extractFragmentParams(tabURL)
+		if err != nil {
+			continue
+		}
+		if returnedState != state {
+			continue
+		}
+
+		if onStatus != nil {
+			onStatus("Authentication detected! Exchanging code for tokens...")
+		}
+		return exchangeCode(code, verifier, realRedirectURI)
 	}
 
-	return exchangeCode(result.code, verifier, redirectURI)
+	return nil, fmt.Errorf("timed out waiting for authentication")
 }
 
-// loginWithPaste uses the real bahn.de redirect URI.
-// User logs in, then pastes the resulting URL back into the CLI.
+// detectBrowser returns the name of a running/available browser on macOS.
+func detectBrowser() string {
+	browsers := []string{"Google Chrome", "Brave Browser", "Chromium"}
+	for _, b := range browsers {
+		// Check if app exists
+		cmd := exec.Command("osascript", "-e",
+			fmt.Sprintf(`tell application "System Events" to (name of processes) contains "%s"`, b))
+		out, err := cmd.Output()
+		if err == nil && strings.TrimSpace(string(out)) == "true" {
+			return b
+		}
+	}
+	// Default to Google Chrome
+	return "Google Chrome"
+}
+
+// getBrowserTabURL reads the current tab's full URL (including fragment)
+// from a Chromium-based browser via AppleScript.
+func getBrowserTabURL(browserName string) (string, error) {
+	script := fmt.Sprintf(`tell application "%s"
+	if (count of windows) > 0 then
+		execute active tab of front window javascript "document.location.href"
+	end if
+end tell`, browserName)
+
+	cmd := exec.Command("osascript", "-e", script)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// loginWithPaste is the fallback: user pastes the callback URL.
 func loginWithPaste(verifier, challenge, state string, onStatus func(string)) (*TokenSet, error) {
 	authURL := buildAuthURL(realRedirectURI, state, challenge)
 
@@ -104,24 +156,20 @@ func loginWithPaste(verifier, challenge, state string, onStatus func(string)) (*
 		onStatus("")
 	}
 
-	// Read URL from stdin
 	fmt.Fprint(os.Stderr, "> ")
 	scanner := bufio.NewScanner(os.Stdin)
 	if !scanner.Scan() {
 		return nil, fmt.Errorf("no input received")
 	}
 	pastedURL := strings.TrimSpace(scanner.Text())
-
 	if pastedURL == "" {
 		return nil, fmt.Errorf("empty URL")
 	}
 
-	// Extract code and state from the URL fragment
 	code, returnedState, err := extractFragmentParams(pastedURL)
 	if err != nil {
 		return nil, err
 	}
-
 	if returnedState != state {
 		return nil, fmt.Errorf("state mismatch: possible CSRF attack")
 	}
@@ -132,15 +180,12 @@ func loginWithPaste(verifier, challenge, state string, onStatus func(string)) (*
 	return exchangeCode(code, verifier, realRedirectURI)
 }
 
-// extractFragmentParams pulls code and state from a URL with a fragment.
-// Handles both full URLs and just fragments.
+// extractFragmentParams pulls code and state from a URL fragment.
 func extractFragmentParams(rawURL string) (code, state string, err error) {
-	// The fragment might be after #
 	var fragment string
 	if idx := strings.Index(rawURL, "#"); idx >= 0 {
 		fragment = rawURL[idx+1:]
 	} else {
-		// Maybe they just pasted the fragment part
 		fragment = rawURL
 	}
 
@@ -156,9 +201,8 @@ func extractFragmentParams(rawURL string) (code, state string, err error) {
 
 	code = params.Get("code")
 	if code == "" {
-		return "", "", fmt.Errorf("no auth code found in URL. Make sure you copied the full URL including the # part")
+		return "", "", fmt.Errorf("no auth code found in URL")
 	}
-
 	state = params.Get("state")
 	return code, state, nil
 }
@@ -171,7 +215,6 @@ func generatePKCE() (verifier, challenge string, err error) {
 		return "", "", err
 	}
 	verifier = base64.RawURLEncoding.EncodeToString(buf)
-
 	hash := sha256.Sum256([]byte(verifier))
 	challenge = base64.RawURLEncoding.EncodeToString(hash[:])
 	return verifier, challenge, nil
@@ -198,71 +241,6 @@ func buildAuthURL(redirectURI, state, challenge string) string {
 	}
 	return keycloakBaseURL + "/auth?" + params.Encode()
 }
-
-// --- Callback server (for localhost approach) ---
-
-type callbackResult struct {
-	code  string
-	state string
-	err   error
-}
-
-func callbackHandler(codeChan chan<- callbackResult) http.Handler {
-	mux := http.NewServeMux()
-
-	mux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = fmt.Fprint(w, callbackHTML)
-	})
-
-	mux.HandleFunc("/exchange", func(w http.ResponseWriter, r *http.Request) {
-		code := r.URL.Query().Get("code")
-		state := r.URL.Query().Get("state")
-		errParam := r.URL.Query().Get("error")
-
-		if errParam != "" {
-			desc := r.URL.Query().Get("error_description")
-			codeChan <- callbackResult{err: fmt.Errorf("auth error: %s (%s)", errParam, desc)}
-		} else if code == "" {
-			codeChan <- callbackResult{err: fmt.Errorf("no auth code received")}
-		} else {
-			codeChan <- callbackResult{code: code, state: state}
-		}
-
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = fmt.Fprint(w, successHTML)
-	})
-
-	return mux
-}
-
-const callbackHTML = `<!DOCTYPE html>
-<html><head><title>bahn-cli</title></head>
-<body>
-<p>Authenticating...</p>
-<script>
-const params = new URLSearchParams(location.hash.slice(1));
-const code = params.get('code');
-const state = params.get('state');
-const error = params.get('error');
-const errorDesc = params.get('error_description');
-let url = '/exchange?';
-if (error) {
-  url += 'error=' + encodeURIComponent(error) + '&error_description=' + encodeURIComponent(errorDesc || '');
-} else if (code) {
-  url += 'code=' + encodeURIComponent(code) + '&state=' + encodeURIComponent(state || '');
-} else {
-  url += 'error=no_code&error_description=No+authorization+code+in+response';
-}
-fetch(url).then(() => {}).catch(() => {});
-</script>
-</body></html>`
-
-const successHTML = `<!DOCTYPE html>
-<html><head><title>bahn-cli</title></head>
-<body>
-<p>✓ Authentication successful. You can close this tab.</p>
-</body></html>`
 
 // --- Token exchange ---
 
