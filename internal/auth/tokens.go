@@ -17,6 +17,7 @@ import (
 type TokenSet struct {
 	AccessToken   string    `json:"accessToken"`
 	IDToken       string    `json:"idToken"`
+	RefreshToken  string    `json:"refreshToken,omitempty"`
 	ExpiresAt     time.Time `json:"expiresAt"`
 	Kundenkontoid string    `json:"kundenkontoid"`
 	Sub           string    `json:"sub"`

@@ -231,20 +231,26 @@ func exchangeCode(code, verifier, redirectURI string) (*TokenSet, error) {
 	}
 
 	var tokenResp struct {
-		AccessToken string `json:"access_token"`
-		IDToken     string `json:"id_token"`
-		TokenType   string `json:"token_type"`
-		ExpiresIn   int    `json:"expires_in"`
-		Scope       string `json:"scope"`
+		AccessToken  string `json:"access_token"`
+		IDToken      string `json:"id_token"`
+		RefreshToken string `json:"refresh_token"`
+		TokenType    string `json:"token_type"`
+		ExpiresIn    int    `json:"expires_in"`
+		Scope        string `json:"scope"`
 	}
 	if err := json.Unmarshal(body, &tokenResp); err != nil {
 		return nil, fmt.Errorf("parsing token response: %w", err)
 	}
+
+	// Log the full response for debugging (stderr)
+	fmt.Fprintf(os.Stderr, "[debug] token response keys: access_token=%v, id_token=%v, refresh_token=%v, expires_in=%d\n",
+		tokenResp.AccessToken != "", tokenResp.IDToken != "", tokenResp.RefreshToken != "", tokenResp.ExpiresIn)
 
 	tokens, err := TokenSetFromJWT(tokenResp.AccessToken)
 	if err != nil {
 		return nil, err
 	}
 	tokens.IDToken = tokenResp.IDToken
+	tokens.RefreshToken = tokenResp.RefreshToken
 	return tokens, nil
 }
