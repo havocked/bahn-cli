@@ -1,18 +1,46 @@
 # bahn-cli — System Software Design
 
-## Overview
+## Philosophy
 
-A Go CLI for Deutsche Bahn that combines public APIs (timetables, disruptions, stations) with authenticated personal endpoints (bookings, trips, delays). Designed as an agent-first tool for OpenClaw integration — not just a query tool, but a proactive travel companion.
+**bahn-cli is a tool built for an AI agent.** Not for a human at a terminal.
 
-## Why This Exists
+Nate already has the DB Navigator app for notifications, booking, and trip tracking. What he doesn't have is a way for **Ori** (his AI assistant) to programmatically access Deutsche Bahn data — to reason about trips, cross-reference with calendars, detect refund opportunities, and weave transit awareness into daily life.
 
-DB Navigator is a black box. You book a trip, then you're on your own until you're standing on a cold platform wondering why your ICE is 47 minutes late. There's no way to:
-- Get notified *before* you leave home that your train is delayed
-- Automatically track delays for Fahrgastrechte refund eligibility
-- See your upcoming trips in a format an AI assistant can reason about
-- Cross-reference disruptions with your actual bookings
+The core idea: **give the agent eyes into the rail system.** Everything else follows from that.
 
-bahn-cli fixes this by making DB data scriptable and agent-accessible.
+### Design Principles
+
+1. **JSON-first, always.** The primary consumer is an LLM parsing stdout. Human-readable output is a nice-to-have, not the goal. Every command defaults to `--json`.
+
+2. **Structured over pretty.** Rich error messages in stderr, clean data in stdout. No spinners, no progress bars, no interactive prompts. The agent can't click things.
+
+3. **Composable.** Each command does one thing and outputs data that can be piped or reasoned about. `bahn trips --json | bahn disruptions --for-trip` is better than one mega-command.
+
+4. **Fail loudly, fail structured.** Errors are JSON too: `{"error": "token_expired", "message": "...", "action": "run bahn auth login"}`. The agent needs to know what went wrong and what to do about it.
+
+5. **Auth is a solved problem, not a feature.** Auth exists to unlock data. It should work reliably and get out of the way. The interesting part is what we do with the data.
+
+## What Ori Gets From This
+
+### Contextual awareness
+- "Nate has an ICE to Berlin at 14:23. It's currently +12min. He can leave 10 min later."
+- "There are disruptions on the S1 — Nate usually takes that to Hbf. He should take the tram."
+
+### Proactive intelligence
+- Cross-reference trips with calendar events: "Your train arrives at 15:47 but your meeting is at 16:00 — tight."
+- Morning briefing: real-time disruption data for home station, not RSS feed parsing
+- Fahrgastrechte detection: "Your train was 67 min late. You're owed €11.48."
+
+### Trip planning assistance
+- When Nate mentions travel, Ori can search connections and present options with prices
+- Monitoring booked trips for delays, platform changes, connection risks
+
+### The agent doesn't need:
+- Pretty terminal tables (JSON is the table)
+- Interactive menus
+- Color output
+- Browser-opening (except for initial auth setup)
+- Notification sending (Ori handles that via WhatsApp/etc.)
 
 ## Architecture
 
@@ -22,356 +50,238 @@ bahn-cli
 ├── internal/
 │   ├── cmd/            # Cobra command definitions
 │   │   ├── root.go
-│   │   ├── auth.go     # Cookie import + status
+│   │   ├── auth.go     # OIDC login + token management
 │   │   ├── trips.go    # Personal bookings
 │   │   ├── board.go    # Departure/arrival boards
 │   │   ├── journey.go  # Connection search
 │   │   ├── disruptions.go
-│   │   ├── station.go  # Station info
+│   │   ├── station.go  # Station info + elevators
 │   │   ├── lookup.go   # Ticket lookup by code
-│   │   ├── onboard.go  # ICE portal (when on train)
-│   │   └── watch.go    # Delay monitoring daemon
+│   │   └── onboard.go  # ICE portal (when on train)
 │   ├── auth/
-│   │   ├── cookies.go  # Browser cookie import (via sweetcookie pattern)
-│   │   ├── jwt.go      # JWT token management + refresh
-│   │   └── store.go    # Credential storage (OS keyring)
+│   │   ├── oidc.go     # PKCE flow + local callback server
+│   │   ├── tokens.go   # JWT parsing, storage, refresh
+│   │   └── session.go  # "Give me an authenticated HTTP client"
 │   ├── api/
 │   │   ├── personal.go # bahn.de internal web API (authenticated)
 │   │   ├── ris.go      # Official RIS API (public, API key)
 │   │   ├── vendo.go    # Vendo/movas API (public, no key)
 │   │   └── iceportal.go# Onboard train API
-│   ├── model/          # Shared types
+│   ├── model/          # Shared types (all JSON-tagged)
 │   │   ├── trip.go
 │   │   ├── station.go
 │   │   ├── board.go
 │   │   └── disruption.go
-│   ├── output/         # Formatters
-│   │   ├── json.go
-│   │   ├── plain.go    # Tab-separated
-│   │   └── human.go    # Colorized terminal
+│   ├── output/
+│   │   └── output.go   # JSON to stdout, diagnostics to stderr
 │   └── config/
 │       └── config.go   # Config file + env vars
 ├── go.mod
 ├── go.sum
 ├── Makefile
-├── .goreleaser.yaml     # Cross-platform release
 └── README.md
 ```
 
 ### Language: Go
 
 - Single static binary — `brew install` or download, no runtime
-- Cobra for CLI (same as gogcli/spogo)
-- Cross-compiles for Linux/macOS/Windows
-- goroutines for concurrent API calls (check multiple trips in parallel)
+- Cobra for CLI
+- Cross-compiles for macOS/Linux
+- goroutines for concurrent API calls
 
 ## API Layers
 
 ### Layer 1: Public APIs (no auth)
 
-**Official RIS API** (`developers.deutschebahn.com`)
-- Requires free registration + API key
-- Rate limited but stable
-- Endpoints: boards, journeys, disruptions, stations
-
 **Vendo/Movas API** (bahn.de backend)
-- No key needed, but aggressive rate limiting
+- No key needed, aggressive rate limiting
 - Used by db-vendo-client community
-- Journeys, departures, arrivals, tickets/pricing
+- Journeys, departures, arrivals
 
-**Use for:** `board`, `journey`, `disruptions`, `station` commands
+**Official RIS API** (`developers.deutschebahn.com`)
+- Free API key registration
+- Rate limited but stable
+- Boards, journeys, disruptions, stations
 
-### Layer 2: Personal API (cookie auth)
+### Layer 2: Personal API (Keycloak OIDC auth)
 
 **bahn.de Internal Web API**
-- Auth: JWT from browser session cookies
-- Cookie import via sweetcookie (Chrome/Firefox/Safari)
-- Auto-refresh tokens where possible
-
-**Known endpoints:**
-```
-GET /web/api/buchung/auftrag/v2
-    ?startIndex=0
-    &auftraegeReturnSize=10
-    &auftragSortOrder=DESCENDING
-    &letzterGeltungszeitpunktVor=<ISO-8601>
-    &kundenprofilId=<profile-id>
-→ List of bookings (Aufträge)
-
-GET /web/api/reisebegleitung/reiseketten
-    ?pagesize=100
-    &types[]=AUFTRAG
-    &types[]=WIEDERHOLEND
-→ Travel chains (trips with legs, times, stations)
-
-GET /web/api/reisebegleitung/reiseketten/<uuid>
-→ Single trip detail (all stops, delays, platforms)
-```
-
-**Use for:** `trips`, `watch` commands
+- Auth: JWT via Keycloak OIDC flow (see `docs/auth-foundation.md`)
+- 5-minute token lifetime, silent refresh via Keycloak session
+- Bookings, trips, travel chains, coach sequences, profile
 
 ### Layer 3: Onboard API (WiFi only)
 
-**ICE Portal** (`iceportal.de` — only works on WIFIonICE)
-```
-GET /api1/rs/status      → speed, GPS, next stop, wifi status
-GET /api1/rs/tripInfo    → full trip with all stops + real-time delays
-```
-
-**Use for:** `onboard` command — fun but niche
+**ICE Portal** (`iceportal.de`)
+- Only works on WIFIonICE
+- Speed, GPS, next stop, full trip with real-time delays
+- No auth needed
 
 ### Layer 4: Ticket Lookup (no auth)
 
-**db-tickets pattern:** Query any ticket with booking code + last name.
-```
-POST https://fahrkarten.bahn.de/mobile/dbc/xs.go
-→ Ticket details, journey legs, price
-```
-
-**Use for:** `lookup` command
+**Booking code + last name** → ticket details, journey legs, price
 
 ## Commands
 
-### Public (no auth required)
+All commands output JSON to stdout by default. Diagnostics/errors go to stderr.
+
+### Public (no auth)
 
 ```bash
-# Departure board
-bahn board "Leipzig Hbf"                    # Next departures
-bahn board "Leipzig Hbf" --arrivals         # Arrivals
-bahn board "Leipzig Hbf" --duration 4h      # Extended window
-bahn board "Leipzig Hbf" --filter ICE       # Only ICE trains
+bahn board "Leipzig Hbf"                    # Departures (JSON)
+bahn board "Leipzig Hbf" --arrivals
+bahn board "Leipzig Hbf" --duration 4h
+bahn board "Leipzig Hbf" --filter ICE
 
-# Search connections
-bahn journey "Leipzig Hbf" "Berlin Hbf"
+bahn journey "Leipzig" "Berlin"
 bahn journey "Leipzig" "Berlin" --time 14:00 --date 2026-02-20
-bahn journey "Leipzig" "Berlin" --json      # For piping
 
-# Current disruptions
-bahn disruptions                             # All current
-bahn disruptions --station "Leipzig Hbf"     # For specific station
-bahn disruptions --line "ICE 1600"           # For specific line
-bahn disruptions --region sachsen            # Regional filter
+bahn disruptions
+bahn disruptions --station "Leipzig Hbf"
+bahn disruptions --line "ICE 1600"
 
-# Station info
-bahn station "Leipzig Hbf"                   # Platforms, services
-bahn station "Leipzig Hbf" --elevators       # Elevator/escalator status
+bahn station "Leipzig Hbf"
+bahn station "Leipzig Hbf" --elevators
 
-# Ticket lookup (no account needed)
-bahn lookup W7KHTA Mustermann               # By booking code + name
+bahn lookup W7KHTA Martin                   # Ticket by booking code
 ```
 
-### Personal (cookie auth required)
+### Personal (auth required)
 
 ```bash
-# Auth
-bahn auth import --browser chrome            # Import cookies
-bahn auth import --browser firefox
-bahn auth status                             # Check auth + profile info
-bahn auth clear                              # Remove stored credentials
+bahn auth login                              # OIDC browser flow (one-time setup)
+bahn auth status                             # Token validity, profile info
+bahn auth refresh                            # Silent token refresh
+bahn auth token <jwt>                        # Manual fallback
+bahn auth clear
 
-# Your trips
 bahn trips                                   # Upcoming booked trips
-bahn trips --past                            # Past trips
-bahn trips --past --days 90                  # Last 90 days
-bahn trips <uuid>                            # Detailed trip view
+bahn trips --past --days 90
+bahn trips <uuid>                            # Full trip detail (stops, delays, seat, booking ref)
 
-# Delay monitoring
-bahn watch                                   # One-shot: check all upcoming trips for delays
-bahn watch --daemon                          # Run continuously, output events
-bahn watch --threshold 5                     # Only report delays > 5 min
+bahn watch                                   # One-shot: all upcoming trips, delays + platform changes
+bahn watch --threshold 5                     # Only delays > 5 min
+```
+
+### Onboard (ICE WiFi only)
+
+```bash
+bahn onboard                                 # Current train status (speed, GPS, next stop)
+bahn onboard --trip                          # Full trip with all stops + delays
 ```
 
 ### Global Flags
 
 ```
---json          Structured JSON output
---plain         Tab-separated, grep-friendly
---no-color      Disable color output
+--human         Human-readable output (opt-in, not default)
+--quiet         Suppress stderr diagnostics
+--verbose       Extra detail in stderr
 --config        Config file path
 --api-key       RIS API key (or BAHN_API_KEY env)
--q, --quiet     Suppress info messages
--v, --verbose   Extra detail
 ```
 
-## OpenClaw Integration — The Proactive Layer
+## Output Contract
 
-This is where bahn-cli becomes more than just a query tool. The real value is **OpenClaw turning raw data into timely, contextual actions.**
+**stdout:** Always valid JSON (or nothing on error). This is the agent's data channel.
 
-### 1. Pre-Departure Alerts (Cron)
+**stderr:** Human-readable diagnostics, warnings, progress info. The agent reads this for error handling.
 
-**Trigger:** Cron job checks your upcoming trips N hours before departure.
+**Exit codes:**
+- `0` — success, JSON on stdout
+- `1` — general error
+- `2` — auth required (token expired/missing)
+- `3` — network error (API unreachable)
+- `4` — not found (station/trip/ticket doesn't exist)
 
-```
-Schedule: Every 30 min (or dynamic based on next departure)
-Payload: agentTurn
-Task: "Run bahn watch --json, check for delays/disruptions on upcoming trips.
-       If any trip in the next 4h has a delay >5min or platform change,
-       alert Nate on WhatsApp with actionable info."
-```
-
-**What Ori does with the data:**
-- "Your 14:23 ICE to Berlin is running 12 min late — now departing 14:35 from platform 11 (changed from 9). You can leave 10 min later."
-- "S-Bahn S1 to the Hauptbahnhof has disruptions — consider taking the tram instead."
-- Cross-references with calendar: "You have a meeting at 16:00 in Berlin. Even with the delay, you'd arrive at 15:47. Tight but doable."
-
-### 2. Morning Briefing Enhancement
-
-**Currently:** The morning briefing checks RSS feeds for transit news.
-**With bahn-cli:** Direct, structured data.
-
-```bash
-# In HEARTBEAT.md morning briefing section:
-bahn disruptions --station "Leipzig Hbf" --json
-bahn trips --json  # Any travel today?
-```
-
-**What changes:**
-- Instead of parsing news articles hoping to find "S-Bahn disruption", we get **real-time structured disruption data**
-- If you have a trip booked today, it shows up with current delay status
-- No more "I think there might be a strike" — it's "S1/S2 suspended until 10:00, replacement bus from Markkleeberg"
-
-### 3. Delay Tracking for Fahrgastrechte
-
-**The money feature.** DB owes you 25% refund for 60min+ delays, 50% for 120min+.
-
-```
-Schedule: After each trip's arrival time + 30min
-Payload: agentTurn
-Task: "Check bahn trips <uuid> --json for final delay data.
-       If arrival delay >= 60min, log to ~/clawd/memory/fahrgastrechte.json
-       and notify Nate: 'Your ICE 1234 arrived 67 min late. You're owed 25%
-       refund (€X.XX). Want me to prepare the claim?'"
-```
-
-**Claim workflow:**
-1. bahn-cli detects delay ≥ 60min on a completed trip
-2. Ori notifies with amount owed
-3. On approval, Ori pre-fills the Fahrgastrechte PDF form with trip data
-4. Sends it to Nate for signature/submission
-
-**State file:** `~/clawd/memory/fahrgastrechte.json`
+**Error format (stdout on non-zero exit):**
 ```json
 {
-  "claims": [
-    {
-      "tripId": "5633beeb-374b-400d-83fd-df46a1020a66",
-      "date": "2026-02-15",
-      "route": "Leipzig Hbf → Berlin Hbf",
-      "train": "ICE 1556",
-      "scheduledArrival": "16:12",
-      "actualArrival": "17:25",
-      "delayMinutes": 73,
-      "ticketPrice": 45.90,
-      "refundPercent": 25,
-      "refundAmount": 11.48,
-      "status": "pending",
-      "claimedAt": null
-    }
-  ]
+  "error": "token_expired",
+  "message": "Access token expired at 2026-02-13T16:25:38Z",
+  "action": "run `bahn auth refresh` or `bahn auth login`"
 }
 ```
 
-### 4. Smart Journey Suggestions
+The `action` field tells the agent exactly what to do to recover.
 
-When Nate mentions traveling somewhere:
+## How Ori Uses This
 
+### In heartbeats / cron jobs
+```bash
+# Morning briefing: any travel today? Any disruptions at home station?
+bahn trips
+bahn disruptions --station "Leipzig Hbf"
+
+# Pre-departure check (cron, 30 min before departure)
+bahn watch
+
+# Post-trip Fahrgastrechte check
+bahn trips <uuid>  # Check actual arrival vs scheduled
+```
+
+### In conversation
 ```
 Nate: "I need to go to Berlin next Tuesday"
-Ori: *runs bahn journey "Leipzig" "Berlin" --date 2026-02-17 --json*
-Ori: "Direct ICE options: 8:23 (arrive 9:35), 10:23 (arrive 11:35), 12:23 (arrive 13:35).
-      The 10:23 has the cheapest Sparpreis at €17.90. Want me to open the booking page?"
+Ori: *runs* bahn journey "Leipzig" "Berlin" --date 2026-02-18
+Ori: "Direct ICE options: 8:23 (arrive 9:35), 10:23 (arrive 11:35).
+      The 10:23 has Sparpreis at €17.90."
 ```
 
-No new code needed in Ori — just `bahn journey` + natural language.
+### Cross-referencing
+Ori combines bahn-cli data with:
+- **Calendar** — "Your train arrives at 15:47, meeting at 16:00"
+- **Weather** — "It's -3°C at Leipzig Hbf, platform 11 is outdoors"
+- **Location context** — "You're at home, 20 min to Hbf by tram"
+- **History** — "This ICE 1556 was late 3 of the last 5 times"
 
-### 5. Connection Watch
-
-For multi-leg trips, the scary part is connections.
-
+### Fahrgastrechte tracking
+Ori maintains `~/clawd/memory/fahrgastrechte.json` by checking completed trips:
+```json
+{
+  "claims": [{
+    "tripId": "...",
+    "date": "2026-02-15",
+    "route": "Leipzig Hbf → Berlin Hbf",
+    "train": "ICE 1556",
+    "scheduledArrival": "16:12",
+    "actualArrival": "17:25",
+    "delayMinutes": 73,
+    "ticketPrice": 45.90,
+    "refundPercent": 25,
+    "refundAmount": 11.48,
+    "status": "pending"
+  }]
+}
 ```
-Trigger: 1h before each connection point
-Task: "Check if the arriving train is delayed enough to miss the connection.
-       If connection is at risk, search alternatives and alert."
-```
-
-"Your RE from Leipzig is 8 min late. Your ICE connection in Halle has 12 min buffer — you'll make it, but hustle."
-
-vs.
-
-"Your RE is 25 min late. You'll miss the 14:45 ICE in Halle. Next option: 15:15 ICE (arrives Berlin 16:47 instead of 16:12). Platform 3."
 
 ## Data Flow
 
 ```
-                    ┌──────────────┐
-                    │   bahn-cli   │
-                    └──────┬───────┘
-                           │ JSON stdout
-                    ┌──────▼───────┐
-                    │   OpenClaw   │
-                    │  (cron/hb)   │
-                    └──────┬───────┘
-                           │ reasoning
-                    ┌──────▼───────┐
-                    │     Ori      │
-                    │  (context +  │
-                    │   judgment)  │
-                    └──────┬───────┘
-                           │ WhatsApp/notification
-                    ┌──────▼───────┐
-                    │     Nate     │
-                    └──────────────┘
+  bahn-cli (data source)
+      │ JSON stdout
+      ▼
+  Ori (reasoning + context)
+      │ natural language
+      ▼
+  Nate (via WhatsApp/chat)
 ```
 
-bahn-cli is the **data source**. Ori is the **brain**. The CLI never sends notifications directly — it outputs structured data that Ori interprets with context (calendar, location, preferences, time of day).
-
-## Auth Strategy
-
-### Cookie Import (spogo-style)
-```bash
-bahn auth import --browser chrome
-# Reads bahn.de cookies from Chrome's cookie store
-# Extracts session/JWT tokens
-# Stores in OS keyring (or encrypted file)
-```
-
-**Cookie targets:**
-- `bahn.de` session cookies
-- JWT access token (if available in cookies/localStorage)
-- `kundenprofilId` (extracted from profile API call after auth)
-
-**Token refresh:**
-- JWT tokens from bahn.de are short-lived
-- Auto-refresh using refresh token if available
-- Fall back to re-importing cookies if refresh fails
-- `bahn auth status` shows expiry time
-
-### Fallback: Manual Token
-```bash
-# For headless setups (Mac Mini)
-bahn auth token <jwt-token>
-# Paste from browser DevTools Network tab
-```
+bahn-cli never sends notifications. It outputs structured data. Ori decides what's worth telling Nate, when, and how.
 
 ## Config
 
 `~/.config/bahn-cli/config.toml`
 ```toml
-[auth]
-# Managed automatically by `bahn auth import`
-
 [api]
-ris_key = ""           # Optional: RIS API key for official endpoints
+ris_key = ""                    # Optional: RIS API key
 default_station = "Leipzig Hbf"
 
 [output]
-format = "human"       # human | json | plain
-color = true
+format = "json"                 # json (default) | human
 
 [watch]
-threshold_minutes = 5  # Min delay to report
-check_before_hours = 4 # How early to start monitoring a trip
-stations = ["Leipzig Hbf", "Leipzig/Halle Flughafen"]  # Home stations for board checks
+threshold_minutes = 5
+check_before_hours = 4
 ```
 
 ## Build & Distribution
@@ -387,56 +297,50 @@ test:
 	go test ./...
 ```
 
-**goreleaser** for:
-- macOS (arm64, amd64)
-- Linux (arm64, amd64)
-- Homebrew tap: `brew install havocked/tap/bahn-cli`
+goreleaser for macOS (arm64, amd64) + Linux. Homebrew tap: `brew install havocked/tap/bahn-cli`.
 
 ## Project Phases
 
-### Phase 1: Foundation
+### Phase 1: Auth + First Data
 - [ ] Project scaffold (Go modules, Cobra, config)
-- [ ] `board` command (via db-vendo-client API, no auth)
-- [ ] `journey` command (connection search)
-- [ ] `disruptions` command
-- [ ] `lookup` command (ticket by code)
-- [ ] Output modes: `--json`, `--plain`, human
+- [ ] OIDC browser login flow (Keycloak PKCE)
+- [ ] Token storage + refresh
+- [ ] `auth login/status/refresh/token/clear`
+- [ ] `trips` command (list + detail)
+- [ ] JSON output contract
 - [ ] Tests
 
-### Phase 2: Personal Data
-- [ ] Cookie import from Chrome/Firefox
-- [ ] JWT extraction + storage
-- [ ] `auth status/import/clear`
-- [ ] `trips` command (list + detail)
-- [ ] Token refresh logic
+### Phase 2: Public Data
+- [ ] `board` command (departures/arrivals)
+- [ ] `journey` command (connection search)
+- [ ] `disruptions` command
+- [ ] `station` command
+- [ ] `lookup` command (ticket by code)
 
-### Phase 3: OpenClaw Integration
-- [ ] `watch` command (one-shot delay check)
-- [ ] OpenClaw skill (SKILL.md + cron templates)
-- [ ] Fahrgastrechte tracking (`~/clawd/memory/fahrgastrechte.json`)
+### Phase 3: Integration
+- [ ] `watch` command (delay monitoring)
+- [ ] OpenClaw skill (SKILL.md)
+- [ ] Fahrgastrechte tracking
 - [ ] Morning briefing integration
-- [ ] Pre-departure alert cron job
+- [ ] Cron job templates
 
-### Phase 4: Polish
-- [ ] `watch --daemon` mode
+### Phase 4: Extras
 - [ ] `onboard` command (ICE portal)
 - [ ] Connection risk detection
 - [ ] Homebrew tap
-- [ ] `station` with elevator status
-- [ ] Fahrgastrechte PDF pre-fill
 
-## Open Questions
+## Dependencies
 
-1. **Cookie longevity:** How long do bahn.de session tokens last? Need to test. If short-lived, may need periodic re-import or a headless browser refresh approach.
+```
+github.com/spf13/cobra           # CLI framework
+github.com/spf13/viper           # Config
+github.com/golang-jwt/jwt/v5     # JWT parsing
+github.com/zalando/go-keyring    # OS keyring
+github.com/pkg/browser           # Open URL in browser (auth only)
+```
 
-2. **Rate limits on internal API:** Unknown. Need to be conservative and cache aggressively.
-
-3. **kundenprofilId discovery:** The bookings endpoint needs this ID. Need to find which endpoint exposes it after auth (likely a profile/account endpoint).
-
-4. **BahnCard integration:** Can we read BahnCard status/number from the account API? Useful for price calculations.
-
-5. **DB Navigator app API vs web API:** The mobile app may use different (better?) endpoints. Worth investigating if web API proves flaky.
+Minimal. No output formatting libraries — JSON is the format.
 
 ---
 
-*Inspired by steipete/spogo (Spotify) and steipete/gogcli (Google). Same philosophy: CLI-first, JSON-native, agent-friendly. Cookie auth where official APIs fall short.*
+*A tool built for Ori. JSON in, reasoning out.*
